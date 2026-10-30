@@ -707,6 +707,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addAnimation:(id)anim // CAAnimation*
             forKey:(id)key { // NSString*
+    // Core Animation copies the animation when it's added, so an animation
+    // object can be re-used, e.g. Mass Effect Galaxy re-adds the same one for
+    // every ability cooldown. We don't copy, so at least forget when it last
+    // started, otherwise it would immediately be considered finished.
+    *crate::frameworks::core_animation::ca_animation::get_animation_start_time(env, anim) = None;
+
     let duration: CFTimeInterval = msg![env; anim duration];
     if duration == 0.0 {
         // From the docs:

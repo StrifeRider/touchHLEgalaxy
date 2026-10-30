@@ -33,6 +33,9 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::packet::Packet;
 use symphonia::core::units::TimeBase;
 
+/// How long after a movie starts before user input can skip it.
+const SKIP_GRACE_PERIOD: Duration = Duration::from_millis(1000);
+
 /// `AL_SEC_OFFSET` from the OpenAL 1.1 specification.
 const AL_SEC_OFFSET: al::al_types::ALenum = 0x1024;
 
@@ -358,7 +361,12 @@ pub fn play_movie_blocking(env: &mut Environment, path: &GuestPath) -> Result<()
             }
             (skip, quit)
         });
-        skipped |= skip_input;
+        // Ignore skip input at the very start, so a click or key press that
+        // was meant for something else (e.g. launching the app, or the
+        // previous screen) doesn't skip the movie by accident.
+        if start.elapsed() >= SKIP_GRACE_PERIOD {
+            skipped |= skip_input;
+        }
         quit |= quit_input;
         if skipped || quit {
             break;

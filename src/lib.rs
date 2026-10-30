@@ -115,6 +115,17 @@ Special options:
 ";
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+    // The default panic handler only prints to stderr, which users on desktop
+    // often can't see, so also put panic messages in the log file.
+    #[cfg(not(target_os = "android"))]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            echo_no_panic!("Panic: {}", info);
+            default_hook(info);
+        }));
+    }
+
     echo!(
         "touchHLE {}{}{} — https://touchhle.org/",
         branding(),
