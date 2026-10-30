@@ -325,6 +325,7 @@ impl Window {
             let window = video_ctx
                 .window(title, width, height)
                 .position_centered()
+                .resizable()
                 .opengl()
                 .build()
                 .unwrap();
@@ -1362,9 +1363,14 @@ impl Window {
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
         let (app_width, app_height) =
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
+        if !self.fullscreen
+            && !Self::rotatable_fullscreen()
+            && self.window.size() == (app_width, app_height)
+        {
             return (0, 0, app_width, app_height);
         }
+        // Otherwise (full screen, or a window the user has resized), scale the
+        // app's output to fit, preserving its aspect ratio.
 
         let (screen_width, screen_height) = self.window.drawable_size();
 

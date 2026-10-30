@@ -57,7 +57,7 @@ pub(super) struct CALayerHostObject {
     pub(super) contents: id,
     /// `NSString*`, nil means default ("resize")
     contents_gravity: id,
-    masks_to_bounds: bool,
+    pub(super) masks_to_bounds: bool,
     /// For CAEAGLLayer only
     pub(super) drawable_properties: id,
     /// For CAEAGLLayer only (internal state for compositor)
@@ -725,7 +725,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let key_string = to_rust_string(env, key);
         log_dbg!("[(CALayer*){:?} addAnimation:{:?} forKey:{:?} ({:?})]", this, anim, key, key_string);
-        env.objc.borrow_mut::<CALayerHostObject>(this).animations.insert(key_string.to_string(), anim);
+        retain(env, anim);
+        let old = env.objc.borrow_mut::<CALayerHostObject>(this).animations.insert(key_string.to_string(), anim);
+        if let Some(old) = old {
+            release(env, old);
+        }
+        return;
     }
     retain(env, anim);
 }

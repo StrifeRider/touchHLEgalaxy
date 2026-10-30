@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub(super) struct State {
     texture_framebuffer: Option<(GLuint, GLuint)>,
+    /// Whether the framebuffer has a stencil buffer, used to implement
+    /// `masksToBounds` clipping.
+    have_stencil: bool,
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
@@ -208,6 +211,45 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
                 gles11::FRAMEBUFFER_COMPLETE_OES
             );
+
+            // Try to add a stencil buffer for masksToBounds clipping. This is
+            // optional: if the driver doesn't like it, clipping is skipped.
+            const DEPTH24_STENCIL8_OES: GLenum = 0x88F0;
+            let mut renderbuffer = 0;
+            gles.GenRenderbuffersOES(1, &mut renderbuffer);
+            gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
+            gles.RenderbufferStorageOES(
+                gles11::RENDERBUFFER_OES,
+                DEPTH24_STENCIL8_OES,
+                fb_width as _,
+                fb_height as _,
+            );
+            gles.FramebufferRenderbufferOES(
+                gles11::FRAMEBUFFER_OES,
+                gles11::STENCIL_ATTACHMENT_OES,
+                gles11::RENDERBUFFER_OES,
+                renderbuffer,
+            );
+            let have_stencil = gles.GetError() == 0
+                && gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES)
+                    == gles11::FRAMEBUFFER_COMPLETE_OES;
+            if !have_stencil {
+                log!("Warning: couldn't create a stencil buffer for composition, masksToBounds will be ignored.");
+                gles.FramebufferRenderbufferOES(
+                    gles11::FRAMEBUFFER_OES,
+                    gles11::STENCIL_ATTACHMENT_OES,
+                    gles11::RENDERBUFFER_OES,
+                    0,
+                );
+                gles.DeleteRenderbuffersOES(1, &renderbuffer);
+                while gles.GetError() != 0 {}
+                assert_eq!(
+                    gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+                    gles11::FRAMEBUFFER_COMPLETE_OES
+                );
+            }
+            gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, 0);
+            env.framework_state.core_animation.composition.have_stencil = have_stencil;
         }
         env.framework_state
             .core_animation
@@ -215,6 +257,8 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .texture_framebuffer = Some((texture, framebuffer));
         texture
     };
+
+    let have_stencil = env.framework_state.core_animation.composition.have_stencil;
 
     // Set up various other GL objects that will be reused on every frame.
     let misc_gl_objects = env
@@ -300,7 +344,15 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     unsafe {
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
         gles.ClearColor(0.0, 0.0, 0.0, 1.0);
-        gles.Clear(gles11::COLOR_BUFFER_BIT);
+        if have_stencil {
+            gles.ClearStencil(0);
+            gles.Clear(gles11::COLOR_BUFFER_BIT | gles11::STENCIL_BUFFER_BIT);
+            gles.Enable(gles11::STENCIL_TEST);
+            gles.StencilFunc(gles11::EQUAL, 0, 0xFF);
+            gles.StencilOp(gles11::KEEP, gles11::KEEP, gles11::KEEP);
+        } else {
+            gles.Clear(gles11::COLOR_BUFFER_BIT);
+        }
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
 
         gles.MatrixMode(gles11::PROJECTION);
@@ -336,6 +388,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
+                0,
             );
         }
     }
@@ -346,6 +399,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Clean up some GL state
     unsafe {
+        gles.Disable(gles11::STENCIL_TEST);
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
         gles.Disable(gles11::BLEND);
@@ -411,6 +465,8 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+    // Number of enclosing masksToBounds layers (the stencil value inside them)
+    clip_depth: u8,
 ) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
@@ -424,10 +480,26 @@ unsafe fn composite_layer_recursive(
         return;
     }
 
+    let have_stencil = env.framework_state.core_animation.composition.have_stencil;
+    let basic_square_buffer = env
+        .framework_state
+        .core_animation
+        .composition
+        .misc_gl_objects
+        .as_ref()
+        .unwrap()
+        .basic_square_buffer;
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
+    if have_stencil {
+        // Only draw inside the enclosing masksToBounds layers, if any.
+        gles.StencilFunc(gles11::EQUAL, clip_depth.into(), 0xFF);
+        gles.StencilOp(gles11::KEEP, gles11::KEEP, gles11::KEEP);
+    }
+
     let opacity = opacity * host_obj.opacity;
+    let quad_matrix;
     let cumulative_transform = {
         let CALayerHostObject { bounds, .. } = host_obj;
 
@@ -439,12 +511,10 @@ unsafe fn composite_layer_recursive(
         // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
         // so it will have the right size in this layer's co-ordinate space.
         gles.MatrixMode(gles11::MODELVIEW);
-        load_matrix(
-            gles.as_mut(),
-            Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
-                .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
-                .multiply(&cumulative_transform),
-        );
+        quad_matrix = Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
+            .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
+            .multiply(&cumulative_transform);
+        load_matrix(gles.as_mut(), quad_matrix);
 
         cumulative_transform
     };
@@ -631,7 +701,14 @@ unsafe fn composite_layer_recursive(
             0 as *const GLvoid,
         );
     }
+    // masksToBounds: mark this layer's bounds in the stencil buffer, so that
+    // sublayers are only drawn inside it.
+    let clip = have_stencil && host_obj.masks_to_bounds && clip_depth < u8::MAX;
+    if clip {
+        update_clip_stencil(gles.as_mut(), basic_square_buffer, clip_depth, gles11::INCR);
+    }
     std::mem::drop(gles);
+    let child_clip_depth = if clip { clip_depth + 1 } else { clip_depth };
 
     // avoid holding mutable borrow while recursing
     let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
@@ -643,8 +720,57 @@ unsafe fn composite_layer_recursive(
     };
     for &child_layer in &original_host_obj.sublayers.clone() {
         // TODO: clipping/masksToBounds support
-        composite_layer_recursive(env, animation_state, child_layer, child_transform, opacity)
+        composite_layer_recursive(
+            env,
+            animation_state,
+            child_layer,
+            child_transform,
+            opacity,
+            child_clip_depth,
+        )
     }
+
+    if clip {
+        // Undo the stencil marking so siblings aren't clipped.
+        let window = env.window.as_mut().unwrap();
+        let mut gles = window.make_internal_gl_ctx_current();
+        gles.MatrixMode(gles11::MODELVIEW);
+        load_matrix(gles.as_mut(), quad_matrix);
+        update_clip_stencil(
+            gles.as_mut(),
+            basic_square_buffer,
+            child_clip_depth,
+            gles11::DECR,
+        );
+        gles.StencilFunc(gles11::EQUAL, clip_depth.into(), 0xFF);
+    }
+}
+
+/// Increments or decrements the stencil value inside the current layer's
+/// bounds (the unit square under the current modelview matrix), where it is
+/// currently equal to `current_depth`. Nothing is drawn to the color buffer.
+unsafe fn update_clip_stencil(
+    gles: &mut dyn GLES,
+    basic_square_buffer: GLuint,
+    current_depth: u8,
+    op: GLenum,
+) {
+    gles.ColorMask(gles11::FALSE, gles11::FALSE, gles11::FALSE, gles11::FALSE);
+    gles.StencilFunc(gles11::EQUAL, current_depth.into(), 0xFF);
+    gles.StencilOp(gles11::KEEP, gles11::KEEP, op);
+    gles.Disable(gles11::TEXTURE_2D);
+    gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.EnableClientState(gles11::VERTEX_ARRAY);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, basic_square_buffer);
+    gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+    gles.DrawElements(
+        gles11::TRIANGLES,
+        SQUARE_INDICES.len() as _,
+        gles11::UNSIGNED_BYTE,
+        0 as *const GLvoid,
+    );
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.StencilOp(gles11::KEEP, gles11::KEEP, gles11::KEEP);
 }
 
 const FLOATS_PER_POINT: usize = 2;

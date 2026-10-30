@@ -172,8 +172,20 @@ impl State {
             };
 
             // Update values only in the presentation layer
+            // If the animation has no key path, Core Animation uses the key
+            // it was added to the layer with.
             let key_path: id = msg![env; animation keyPath];
-            let key_path = to_rust_string(env, key_path);
+            let key_path = if key_path != nil {
+                to_rust_string(env, key_path).to_string()
+            } else if let Some(key) = key {
+                key.clone()
+            } else {
+                log!(
+                    "TODO: Animation {:?} has no key path or key, ignoring",
+                    animation
+                );
+                continue;
+            };
             // Only these properties are animatable
             // TODO: Implement for all properties
             match &*key_path {
@@ -307,7 +319,11 @@ impl State {
     pub fn update_started_and_finished_animations(self, env: &mut Environment) {
         for animation in self.started_animations {
             let delegate = msg![env; animation delegate];
-            if delegate != nil {
+            // The delegate methods are optional.
+            let sel = env
+                .objc
+                .register_host_selector("animationDidStart:".to_string(), &mut env.mem);
+            if delegate != nil && msg![env; delegate respondsToSelector:sel] {
                 () = msg![env; delegate animationDidStart: animation];
             }
         }
@@ -317,7 +333,10 @@ impl State {
         }
         for (layer, animation, finished, removed_on_completion, key) in self.finished_animations {
             let delegate = msg![env; animation delegate];
-            if delegate != nil {
+            let sel = env
+                .objc
+                .register_host_selector("animationDidStop:finished:".to_string(), &mut env.mem);
+            if delegate != nil && msg![env; delegate respondsToSelector:sel] {
                 () = msg![env; delegate animationDidStop: animation finished: finished];
             }
 
