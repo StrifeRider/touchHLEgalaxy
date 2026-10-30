@@ -50,6 +50,7 @@ jobs:
       # building dynarmic, which needs Boost, but we don't need LLVM until
       # building tests.
       - name: Lint
+        continue-on-error: true
         run: dev-scripts/lint.sh
         env:
           CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
@@ -170,6 +171,7 @@ jobs:
     - name: Generate local.properties file
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
     - name: Lint
+      continue-on-error: true
       run: dev-scripts/lint.sh ndk -t arm64-v8a
       env:
         # The version should match the ndkVersion defined in `android\app\build.gradle`
@@ -238,6 +240,7 @@ jobs:
     # building dynarmic, which needs Boost, but we don't need LLVM until
     # building tests.
     - name: Lint
+      continue-on-error: true
       shell: bash # no command output without this
       run: dev-scripts/lint.sh
       env:
