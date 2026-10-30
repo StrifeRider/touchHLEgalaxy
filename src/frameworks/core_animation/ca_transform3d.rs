@@ -128,7 +128,7 @@ impl CATransform3D {
         t
     }
 
-    pub fn to_affine(&self) -> CGAffineTransform {
+    pub fn to_affine(self) -> CGAffineTransform {
         CGAffineTransform {
             a: self.get(0, 0),
             b: self.get(0, 1),
