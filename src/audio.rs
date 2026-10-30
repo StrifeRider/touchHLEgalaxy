@@ -14,7 +14,7 @@
 
 mod ima4;
 pub mod openal;
-mod symphonia_formats;
+pub(crate) mod symphonia_formats;
 
 pub use ima4::decode_ima4;
 

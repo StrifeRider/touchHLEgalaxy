@@ -83,8 +83,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation MPMoviePlayerController: NSObject
 
-// TODO: actual playback
-
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(MPMoviePlayerControllerHostObject {
         content_url: nil,
@@ -93,8 +91,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentURL:(id)url { // NSURL*
-    log!(
-        "TODO: [(MPMoviePlayerController*){:?} initWithContentURL:{:?} ({:?})]",
+    log_dbg!(
+        "[(MPMoviePlayerController*){:?} initWithContentURL:{:?} ({:?})]",
         this,
         url,
         ns_url::to_rust_path(env, url),
@@ -167,7 +165,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MPMediaPlayback implementation
 - (())play {
-    log!("TODO: [(MPMoviePlayerController*){:?} play]", this);
+    log_dbg!("[(MPMoviePlayerController*){:?} play]", this);
     if let Some(old) = env.framework_state.media_player.movie_player.active_player {
         let _: () = msg![env; old stop];
     }
@@ -176,9 +174,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     retain(env, this);
     env.framework_state.media_player.movie_player.active_player = Some(this);
 
-    // Act as if playback immediately completed after 1 second
+    // Actually play the movie (this blocks until it's done or skipped). If it
+    // can't be played, act as if playback completed after 1 second
     // (various apps wait for this, such as BIA and Hero of Sparta).
-    let notif = (MPMoviePlayerPlaybackDidFinishNotification, this, Instant::now().checked_add(Duration::from_millis(1000)).unwrap());
+    let url = env.objc.borrow::<MPMoviePlayerControllerHostObject>(this).content_url;
+    let path = ns_url::to_rust_path(env, url).into_owned();
+    if let Err(e) = super::movie_playback::play_movie_blocking(env, &path) {
+        log!("Couldn't play movie {:?}: {}", path, e);
+    }
+    // Some apps can't handle the notification arriving too soon, even
+    // after a movie actually played, so keep the same delay either way.
+    let delay = Duration::from_millis(1000);
+    let notif = (MPMoviePlayerPlaybackDidFinishNotification, this, Instant::now().checked_add(delay).unwrap());
     for (name, obj, _) in &mut State::get(env).pending_notifications {
         // De-duplicate similar notifications. This can happen if app is calling
         // `play` twice on the same player object (case of NOVA2).

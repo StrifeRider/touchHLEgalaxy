@@ -11,6 +11,7 @@ mod media_library;
 mod media_picker_controller;
 mod media_playlist;
 mod media_query;
+pub(crate) mod movie_playback;
 mod movie_player;
 mod music_player;
 

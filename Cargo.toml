@@ -58,6 +58,10 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "aac", "adpcm", "alac", "mp3", "pcm"
 ] }
 quick-xml = "0.38.4"
+# For movie playback (MPMoviePlayerController). Only Baseline profile H.264,
+# which is what iPhone OS 2/3 era apps use. Built from source; the bundled
+# assembly is used only if NASM is available.
+openh264 = { version = "0.9.9", default-features = false, features = ["source"] }
 digest = "0.10.7"
 md-5 = "0.10.6"
 sha1 = "0.10.6"

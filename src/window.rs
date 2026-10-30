@@ -931,6 +931,7 @@ impl Window {
                     ""
                 }
             );
+            log!("You can also use the W/A/S/D or arrow keys to tilt the device.");
         }
     }
 
@@ -965,7 +966,9 @@ impl Window {
         } else {
             // Get left analog stick input. The range is [-1, 1] on each axis.
             let (x, y, _) = self.get_controller_stick(options, true);
-            (x, y)
+            // Keyboard input (WASD or arrow keys) acts like a digital stick.
+            let (kx, ky) = self.get_keyboard_stick();
+            ((x + kx).clamp(-1.0, 1.0), (y + ky).clamp(-1.0, 1.0))
         };
 
         // Correct for window rotation
@@ -1109,6 +1112,38 @@ impl Window {
     /// Get the summed X and Y positions and button state of the left or right
     /// analog stick of the game controllers. Each axis value is in the range
     /// [-1, 1].
+    /// Whether a key that should skip a movie (Escape, Space, Return) is held.
+    pub fn is_skip_key_pressed(&self) -> bool {
+        use sdl2::keyboard::Scancode;
+        let keys = self.event_pump.keyboard_state();
+        [Scancode::Escape, Scancode::Space, Scancode::Return]
+            .into_iter()
+            .any(|k| keys.is_scancode_pressed(k))
+    }
+
+    /// Get a simulated analog stick position from the W/A/S/D and arrow keys,
+    /// using the same conventions as [Self::get_controller_stick].
+    fn get_keyboard_stick(&self) -> (f32, f32) {
+        use sdl2::keyboard::Scancode;
+        let keys = self.event_pump.keyboard_state();
+        let pressed = |a, b| keys.is_scancode_pressed(a) || keys.is_scancode_pressed(b);
+        let mut x = 0.0;
+        let mut y = 0.0;
+        if pressed(Scancode::A, Scancode::Left) {
+            x -= 1.0;
+        }
+        if pressed(Scancode::D, Scancode::Right) {
+            x += 1.0;
+        }
+        if pressed(Scancode::W, Scancode::Up) {
+            y -= 1.0;
+        }
+        if pressed(Scancode::S, Scancode::Down) {
+            y += 1.0;
+        }
+        (x, y)
+    }
+
     fn get_controller_stick(&self, options: &Options, left: bool) -> (f32, f32, bool) {
         fn convert_axis(axis: i16, deadzone: f32) -> f32 {
             assert!(deadzone >= 0.0);
