@@ -18,13 +18,16 @@
 //!   <https://developer.apple.com/documentation/quartzcore/cabasicanimation?language=objc>
 use std::ops::Sub;
 
+use crate::frameworks::core_animation::ca_animation::keyframe_segment;
 use crate::frameworks::core_animation::ca_animation::{
     get_animation_start_time, kCAFillModeBackwards, kCAFillModeBoth, kCAFillModeForwards,
     CAMediaTimingFillMode,
 };
 use crate::frameworks::core_animation::ca_layer::remove_anonymous_animation;
+use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
 use crate::frameworks::core_animation::{ca_layer::CALayerHostObject, CACurrentMediaTime};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
+use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::objc::{id, msg, nil, release, retain};
@@ -106,8 +109,9 @@ impl State {
             };
 
             let duration: CFTimeInterval = msg![env; animation duration];
-            let current_repeat = (((current_time - effective_begin_time).max(0.0) / duration)
-                as f32)
+            let time_offset: CFTimeInterval = msg![env; animation timeOffset];
+            let current_repeat = (((current_time - effective_begin_time + time_offset).max(0.0)
+                / duration) as f32)
                 .min(effective_repeat_count);
 
             let mut progress = current_repeat.fract();
@@ -125,6 +129,7 @@ impl State {
 
             let timing_function: id = msg![env; animation timingFunction];
             let interpolation_amount: f32 = msg![env; timing_function _solveForInput: progress];
+            let cumulative: bool = msg![env; animation isCumulative];
 
             if current_repeat >= effective_repeat_count {
                 let removed_on_completion: bool = msg![env; animation isRemovedOnCompletion];
@@ -140,12 +145,31 @@ impl State {
                 }
             }
 
-            // Assuming all animations here are CABasicAnimation
+            // CABasicAnimation, or CAKeyframeAnimation (which is reduced
+            // to a basic animation between the two surrounding keyframes).
             // TODO: Handle other types of animations
-
-            let from_value: id = msg![env; animation fromValue];
-            let to_value: id = msg![env; animation toValue];
-            let by_value: id = msg![env; animation byValue];
+            let (from_value, to_value, by_value, interpolation_amount) =
+                if let Some((from, to, amount)) =
+                    keyframe_segment(env, animation, interpolation_amount)
+                {
+                    (from, to, nil, amount)
+                } else {
+                    let from_value: id = msg![env; animation fromValue];
+                    let to_value: id = msg![env; animation toValue];
+                    let by_value: id = msg![env; animation byValue];
+                    (from_value, to_value, by_value, interpolation_amount)
+                };
+            // Cumulative animations build on the end value of each previous
+            // repetition, which for linear interpolation is extrapolation.
+            let interpolation_amount = if cumulative && !is_keyframe(env, animation) {
+                interpolation_amount
+                    + current_repeat
+                        .min(effective_repeat_count - 1.0)
+                        .max(0.0)
+                        .floor()
+            } else {
+                interpolation_amount
+            };
 
             // Update values only in the presentation layer
             let key_path: id = msg![env; animation keyPath];
@@ -249,7 +273,31 @@ impl State {
                     );
                     presentation.position = from_value + by_value * interpolation_amount;
                 }
-                _ => panic!("Attempted to animate on key {}", key_path),
+                "transform" => {
+                    let current = CATransform3D::from_affine(presentation.affine_transform);
+                    let get = |env: &mut Environment, v: id| -> Option<CATransform3D> {
+                        id_as_option(v).map(|obj| msg![env; obj CATransform3DValue])
+                    };
+                    let from_t = get(env, from_value);
+                    let to_t = get(env, to_value);
+                    let by_t = get(env, by_value);
+                    let (from_t, to_t) = match (from_t, to_t, by_t) {
+                        (Some(f), Some(t), _) => (f, t),
+                        (Some(f), None, Some(b)) => (f, f.concat(&b)),
+                        (None, Some(t), _) => (current, t),
+                        (Some(f), None, None) => (f, current),
+                        (None, None, Some(b)) => (current, current.concat(&b)),
+                        (None, None, None) => (current, current),
+                    };
+                    presentation.affine_transform = interpolate_affine(
+                        from_t.to_affine(),
+                        to_t.to_affine(),
+                        interpolation_amount,
+                    );
+                }
+                _ => {
+                    log!("TODO: Attempted to animate on key {}, ignoring", key_path);
+                }
             }
         }
 
@@ -322,6 +370,49 @@ where
         // current value of keyPath in the target layer’s presentation layer.
         unimplemented!()
     }
+}
+
+/// Interpolates two affine transforms by decomposing them into translation,
+/// rotation and scale, similar to what Core Animation does, so that
+/// rotations animate as rotations rather than as a matrix cross-fade.
+fn interpolate_affine(a: CGAffineTransform, b: CGAffineTransform, t: f32) -> CGAffineTransform {
+    fn decompose(m: CGAffineTransform) -> (f32, f32, f32, f32, f32) {
+        let sx = (m.a * m.a + m.b * m.b).sqrt();
+        let angle = m.b.atan2(m.a);
+        let det = m.a * m.d - m.b * m.c;
+        let sy = if sx != 0.0 {
+            det / sx
+        } else {
+            (m.c * m.c + m.d * m.d).sqrt()
+        };
+        (m.tx, m.ty, angle, sx, sy)
+    }
+    let (ax, ay, aa, asx, asy) = decompose(a);
+    let (bx, by, ba, bsx, bsy) = decompose(b);
+    let mut da = ba - aa;
+    // Shortest path
+    while da > std::f32::consts::PI {
+        da -= 2.0 * std::f32::consts::PI;
+    }
+    while da < -std::f32::consts::PI {
+        da += 2.0 * std::f32::consts::PI;
+    }
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    let angle = aa + da * t;
+    let (sx, sy) = (lerp(asx, bsx), lerp(asy, bsy));
+    let (s, c) = angle.sin_cos();
+    CGAffineTransform {
+        a: c * sx,
+        b: s * sx,
+        c: -s * sy,
+        d: c * sy,
+        tx: lerp(ax, bx),
+        ty: lerp(ay, by),
+    }
+}
+
+fn is_keyframe(env: &mut Environment, animation: id) -> bool {
+    keyframe_segment(env, animation, 0.0).is_some()
 }
 
 fn id_as_option(value: id) -> Option<id> {

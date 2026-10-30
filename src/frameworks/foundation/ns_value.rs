@@ -29,6 +29,7 @@ pub(super) enum NSValueHostObject {
     CGPoint(CGPoint),
     CGSize(CGSize),
     CGRect(CGRect),
+    CATransform3D(crate::frameworks::core_animation::ca_transform3d::CATransform3D),
 }
 impl HostObject for NSValueHostObject {}
 
@@ -129,6 +130,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSValueHostObject::CGRect(value));
     let new = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, new)
+}
+
++ (id)valueWithCATransform3D:(crate::frameworks::core_animation::ca_transform3d::CATransform3D)value {
+    let host_object = Box::new(NSValueHostObject::CATransform3D(value));
+    let new = env.objc.alloc_object(this, host_object, &mut env.mem);
+    autorelease(env, new)
+}
+
+- (crate::frameworks::core_animation::ca_transform3d::CATransform3D)CATransform3DValue {
+    let host_object = env.objc.borrow::<NSValueHostObject>(this);
+    match host_object {
+        NSValueHostObject::CATransform3D(t) => *t,
+        _ => unimplemented!()
+    }
 }
 
 - (CGPoint)CGPointValue {

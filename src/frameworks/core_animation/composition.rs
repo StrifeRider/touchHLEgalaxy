@@ -13,6 +13,7 @@
 use super::ca_eagl_layer::find_fullscreen_eagl_layer;
 use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
+use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransformIdentity;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
 use crate::gles::gles11_raw as gles11; // constants only
@@ -634,15 +635,15 @@ unsafe fn composite_layer_recursive(
 
     // avoid holding mutable borrow while recursing
     let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    let child_transform = if host_obj.sublayer_transform == CGAffineTransformIdentity {
+        cumulative_transform
+    } else {
+        <Matrix<4> as From<_>>::from(host_obj.sublayer_transform_matrix())
+            .multiply(&cumulative_transform)
+    };
     for &child_layer in &original_host_obj.sublayers.clone() {
         // TODO: clipping/masksToBounds support
-        composite_layer_recursive(
-            env,
-            animation_state,
-            child_layer,
-            cumulative_transform,
-            opacity,
-        )
+        composite_layer_recursive(env, animation_state, child_layer, child_transform, opacity)
     }
 }
 

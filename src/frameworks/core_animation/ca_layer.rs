@@ -24,7 +24,7 @@ use crate::frameworks::core_graphics::cg_image::{
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{self, get_static_str, to_rust_string};
-use crate::mem::{GuestUSize, Ptr};
+use crate::mem::{ConstVoidPtr, GuestUSize, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter,
     ClassExports, HostObject, ObjC,
@@ -44,6 +44,8 @@ pub(super) struct CALayerHostObject {
     pub(super) position: CGPoint,
     pub(super) anchor_point: CGPoint,
     pub(super) affine_transform: CGAffineTransform,
+    /// Projected to 2D, see `CATransform3D::to_affine`
+    pub(super) sublayer_transform: CGAffineTransform,
     pub(super) hidden: bool,
     pub(super) opaque: bool,
     pub(super) opacity: f32,
@@ -53,6 +55,9 @@ pub(super) struct CALayerHostObject {
     pub(super) needs_display_on_bounds_change: bool,
     /// `CGImageRef*`
     pub(super) contents: id,
+    /// `NSString*`, nil means default ("resize")
+    contents_gravity: id,
+    masks_to_bounds: bool,
     /// For CAEAGLLayer only
     pub(super) drawable_properties: id,
     /// For CAEAGLLayer only (internal state for compositor)
@@ -74,6 +79,16 @@ impl CALayerHostObject {
     /// position is specified in) to the layer's internal co-ordinate space
     /// (the space that the layer's bounds and its sublayers' positions are
     /// specified in).
+    /// Transform applied to sublayers (in this layer's co-ordinate space),
+    /// relative to the anchor point, as Core Animation does.
+    pub(super) fn sublayer_transform_matrix(&self) -> CGAffineTransform {
+        let ax = self.bounds.origin.x + self.bounds.size.width * self.anchor_point.x;
+        let ay = self.bounds.origin.y + self.bounds.size.height * self.anchor_point.y;
+        CGAffineTransform::make_translation(-ax, -ay)
+            .concat(self.sublayer_transform)
+            .concat(CGAffineTransform::make_translation(ax, ay))
+    }
+
     pub(super) fn superlayer_to_layer_transform(&self) -> CGAffineTransform {
         CGAffineTransform::make_translation(-self.bounds.origin.x, -self.bounds.origin.y)
             .concat(CGAffineTransform::make_translation(
@@ -93,6 +108,42 @@ pub const kCAFilterNearest: &str = "kCAFilterNearest";
 pub const kCAFilterTrilinear: &str = "kCAFilterTrilinear";
 
 pub const CONSTANTS: ConstantExports = &[
+    ("_kCAGravityCenter", HostConstant::NSString("center")),
+    ("_kCAGravityTop", HostConstant::NSString("top")),
+    ("_kCAGravityBottom", HostConstant::NSString("bottom")),
+    ("_kCAGravityLeft", HostConstant::NSString("left")),
+    ("_kCAGravityRight", HostConstant::NSString("right")),
+    ("_kCAGravityTopLeft", HostConstant::NSString("topLeft")),
+    ("_kCAGravityTopRight", HostConstant::NSString("topRight")),
+    (
+        "_kCAGravityBottomLeft",
+        HostConstant::NSString("bottomLeft"),
+    ),
+    (
+        "_kCAGravityBottomRight",
+        HostConstant::NSString("bottomRight"),
+    ),
+    ("_kCAGravityResize", HostConstant::NSString("resize")),
+    (
+        "_kCAGravityResizeAspect",
+        HostConstant::NSString("resizeAspect"),
+    ),
+    (
+        "_kCAGravityResizeAspectFill",
+        HostConstant::NSString("resizeAspectFill"),
+    ),
+    (
+        "_CATransform3DIdentity",
+        HostConstant::Custom(|env| -> ConstVoidPtr {
+            // CATransform3D is a 4x4 matrix of CGFloat (f32 on 32-bit iOS).
+            let ptr: crate::mem::MutPtr<f32> = env.mem.alloc(16 * 4).cast();
+            for i in 0..16u32 {
+                env.mem
+                    .write(ptr + i, if i % 5 == 0 { 1.0f32 } else { 0.0f32 });
+            }
+            ptr.cast().cast_const()
+        }),
+    ),
     ("_kCAFilterLinear", HostConstant::NSString(kCAFilterLinear)),
     (
         "_kCAFilterNearest",
@@ -122,6 +173,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         position: CGPoint { x: 0.0, y: 0.0 },
         anchor_point: CGPoint { x: 0.5, y: 0.5 },
         affine_transform: CGAffineTransformIdentity,
+        sublayer_transform: CGAffineTransformIdentity,
         hidden: false,
         opaque: false,
         opacity: 1.0,
@@ -130,6 +182,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         needs_display: false,
         needs_display_on_bounds_change: false,
         contents: nil,
+        contents_gravity: nil,
+        masks_to_bounds: false,
         drawable_properties: nil,
         presented_pixels: None,
         cg_context: None,
@@ -164,6 +218,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     if contents != nil {
         release(env, contents);
     }
+
+    let gravity = env.objc.borrow::<CALayerHostObject>(this).contents_gravity;
+    release(env, gravity);
 
     if let Some(cg_context) = cg_context {
         CGContextRelease(env, cg_context);
@@ -218,6 +275,58 @@ pub const CLASSES: ClassExports = objc_classes! {
     let CALayerHostObject { ref mut sublayers, .. } = env.objc.borrow_mut(this);
     let idx = sublayers.iter().position(|&sublayer| sublayer == sibling).unwrap();
     sublayers.insert(idx, layer);
+}
+
+- (())insertSublayer:(id)layer above:(id)sibling {
+    retain(env, layer);
+    () = msg![env; layer removeFromSuperlayer];
+    env.objc.borrow_mut::<CALayerHostObject>(layer).superlayer = this;
+
+    let CALayerHostObject { ref mut sublayers, .. } = env.objc.borrow_mut(this);
+    let idx = sublayers.iter().position(|&sublayer| sublayer == sibling);
+    match idx {
+        Some(idx) => sublayers.insert(idx + 1, layer),
+        None => sublayers.push(layer),
+    }
+}
+
+- (id)sublayers {
+    let sublayers = env.objc.borrow::<CALayerHostObject>(this).sublayers.clone();
+    for &sublayer in &sublayers {
+        retain(env, sublayer);
+    }
+    let array = crate::frameworks::foundation::ns_array::from_vec(env, sublayers);
+    autorelease(env, array)
+}
+
+- (id)presentationLayer {
+    // Snapshot of the layer's current animated state.
+    let mut state = super::animation::State::default();
+    let presentation = state.create_presentation_layer(env, this);
+    let class: crate::objc::Class = msg![env; this class];
+    let layer: id = msg![env; class new];
+    {
+        let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        host.bounds = presentation.bounds;
+        host.position = presentation.position;
+        host.anchor_point = presentation.anchor_point;
+        host.affine_transform = presentation.affine_transform;
+        host.sublayer_transform = presentation.sublayer_transform;
+        host.hidden = presentation.hidden;
+        host.opaque = presentation.opaque;
+        host.opacity = presentation.opacity;
+        host.background_color = presentation.background_color;
+        host.corner_radius = presentation.corner_radius;
+    }
+    autorelease(env, layer)
+}
+
+- (crate::frameworks::core_animation::ca_transform3d::CATransform3D)sublayerTransform {
+    let affine = env.objc.borrow::<CALayerHostObject>(this).sublayer_transform;
+    crate::frameworks::core_animation::ca_transform3d::CATransform3D::from_affine(affine)
+}
+- (())setSublayerTransform:(crate::frameworks::core_animation::ca_transform3d::CATransform3D)transform {
+    env.objc.borrow_mut::<CALayerHostObject>(this).sublayer_transform = transform.to_affine();
 }
 
 - (())removeFromSuperlayer {
@@ -285,6 +394,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     if is_implicit_animation_enabled(env, this) && old_affine_transform != affine_transform {
         log!("TODO: Implicit animation for affineTransform change from {old_affine_transform:?} to {affine_transform:?}");
     }
+}
+
+- (crate::frameworks::core_animation::ca_transform3d::CATransform3D)transform {
+    let affine = env.objc.borrow::<CALayerHostObject>(this).affine_transform;
+    crate::frameworks::core_animation::ca_transform3d::CATransform3D::from_affine(affine)
+}
+- (())setTransform:(crate::frameworks::core_animation::ca_transform3d::CATransform3D)transform {
+    // The compositor is 2D-only: project to an affine transform.
+    let affine = transform.to_affine();
+    () = msg![env; this setAffineTransform:affine];
+}
+
+- (id)contentsGravity {
+    let gravity = env.objc.borrow::<CALayerHostObject>(this).contents_gravity;
+    if gravity == nil {
+        crate::frameworks::foundation::ns_string::get_static_str(env, "resize")
+    } else {
+        gravity
+    }
+}
+- (())setContentsGravity:(id)gravity { // NSString*
+    // TODO: The compositor always stretches contents to fill the bounds.
+    retain(env, gravity);
+    let old = std::mem::replace(&mut env.objc.borrow_mut::<CALayerHostObject>(this).contents_gravity, gravity);
+    release(env, old);
+}
+
+- (bool)masksToBounds {
+    env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds
+}
+- (())setMasksToBounds:(bool)value {
+    // TODO: The compositor doesn't clip yet.
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = value;
 }
 
 - (CGRect)frame {
@@ -596,6 +738,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 }
 
+- (())removeAllAnimations {
+    let host = env.objc.borrow_mut::<CALayerHostObject>(this);
+    let named: Vec<id> = host.animations.drain().map(|(_, a)| a).collect();
+    let anonymous: Vec<id> = host.anonymous_animations.drain().collect();
+    for anim in named.into_iter().chain(anonymous) {
+        release(env, anim);
+    }
+}
+
 // TODO: more
 
 @end
@@ -608,8 +759,10 @@ pub fn remove_anonymous_animation(env: &mut Environment, layer: id, animation: i
         .borrow_mut::<CALayerHostObject>(layer)
         .anonymous_animations
         .remove(&animation);
-    assert!(removed);
-    release(env, animation);
+    // May already have been removed, e.g. by removeAllAnimations.
+    if removed {
+        release(env, animation);
+    }
 }
 
 fn transform_for_conversion(env: &mut Environment, this: id, other: id) -> CGAffineTransform {

@@ -9,6 +9,8 @@ use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_animation::ca_media_timing_function::kCAMediaTimingFunctionDefault;
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
+use crate::frameworks::foundation::NSUInteger;
+use crate::objc::Class;
 use crate::objc::{
     autorelease, id, msg, nil, objc_classes, release, retain, todo_objc_setter, ClassExports,
     HostObject, NSZonePtr,
@@ -72,12 +74,17 @@ struct CAAnimationHostObject {
     duration: CFTimeInterval,
     fill_mode: &'static str,
     started_at: Option<CFTimeInterval>,
+    time_offset: CFTimeInterval,
+    /// Only meaningful for CAPropertyAnimation
+    cumulative: bool,
 }
 impl HostObject for CAAnimationHostObject {}
 impl Default for CAAnimationHostObject {
     fn default() -> Self {
         Self {
             removed_on_completion: true,
+            time_offset: 0.0,
+            cumulative: false,
             timing_function: Default::default(),
             delegate: Default::default(),
             autoreverses: Default::default(),
@@ -105,6 +112,16 @@ struct CABasicAnimationHostObject {
     by_value: id,
 }
 impl_HostObject_with_superclass!(CABasicAnimationHostObject);
+
+#[derive(Default)]
+struct CAKeyframeAnimationHostObject {
+    superclass: CAPropertyAnimationHostObject,
+    /// `NSArray*`
+    values: id,
+    /// `NSArray*` of `NSNumber*`, or nil
+    key_times: id,
+}
+impl_HostObject_with_superclass!(CAKeyframeAnimationHostObject);
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -163,6 +180,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (bool)autoreverses {
     env.objc.borrow::<CAAnimationHostObject>(this).autoreverses
+}
+
+- (())setTimeOffset:(CFTimeInterval)offset {
+    env.objc.borrow_mut::<CAAnimationHostObject>(this).time_offset = offset;
+}
+- (CFTimeInterval)timeOffset {
+    env.objc.borrow::<CAAnimationHostObject>(this).time_offset
+}
+
+- (())setCumulative:(bool)cumulative {
+    env.objc.borrow_mut::<CAAnimationHostObject>(this).cumulative = cumulative;
+}
+- (bool)isCumulative {
+    env.objc.borrow::<CAAnimationHostObject>(this).cumulative
 }
 
 - (())setRepeatCount:(f32)repeatCount {
@@ -305,6 +336,41 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 
+@implementation CAKeyframeAnimation: CAPropertyAnimation
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::<CAKeyframeAnimationHostObject>::default();
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())setValues:(id)values { // NSArray*
+    let values: id = msg![env; values copy];
+    let old = std::mem::replace(&mut env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).values, values);
+    release(env, old);
+}
+- (id)values {
+    env.objc.borrow::<CAKeyframeAnimationHostObject>(this).values
+}
+
+- (())setKeyTimes:(id)key_times { // NSArray*
+    let key_times: id = msg![env; key_times copy];
+    let old = std::mem::replace(&mut env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).key_times, key_times);
+    release(env, old);
+}
+- (id)keyTimes {
+    env.objc.borrow::<CAKeyframeAnimationHostObject>(this).key_times
+}
+
+- (())dealloc {
+    let &CAKeyframeAnimationHostObject { values, key_times, .. } = env.objc.borrow(this);
+    release(env, values);
+    release(env, key_times);
+    msg_super![env; this dealloc]
+}
+
+@end
+
+
 @implementation CATransition : CAAnimation
 
 + (id)allocWithZone:(NSZonePtr)_zone {
@@ -319,6 +385,69 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// For a `CAKeyframeAnimation`, returns the keyframe values surrounding
+/// `progress` (in 0..1) and the interpolation amount between them. Returns
+/// `None` for other animation classes.
+pub fn keyframe_segment(
+    env: &mut Environment,
+    animation: id,
+    progress: f32,
+) -> Option<(id, id, f32)> {
+    let class: Class = msg_class![env; CAKeyframeAnimation class];
+    let is_keyframe: bool = msg![env; animation isKindOfClass:class];
+    if !is_keyframe {
+        return None;
+    }
+    let &CAKeyframeAnimationHostObject {
+        values, key_times, ..
+    } = env.objc.borrow(animation);
+    let count: NSUInteger = if values == nil {
+        0
+    } else {
+        msg![env; values count]
+    };
+    if count == 0 {
+        return Some((nil, nil, 0.0));
+    }
+    if count == 1 {
+        let v: id = msg![env; values objectAtIndex:0u32];
+        return Some((v, v, 0.0));
+    }
+    let progress = progress.clamp(0.0, 1.0);
+    let key_time_count: NSUInteger = if key_times == nil {
+        0
+    } else {
+        msg![env; key_times count]
+    };
+    let (idx, amount) = if key_time_count == count {
+        let mut times = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let n: id = msg![env; key_times objectAtIndex:i];
+            let t: f32 = msg![env; n floatValue];
+            times.push(t);
+        }
+        let mut idx = 0;
+        while idx + 2 < times.len() && progress >= times[idx + 1] {
+            idx += 1;
+        }
+        let span = times[idx + 1] - times[idx];
+        let amount = if span > 0.0 {
+            ((progress - times[idx]) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        (idx as NSUInteger, amount)
+    } else {
+        // Evenly spaced keyframes (linear calculation mode).
+        let pos = progress * (count - 1) as f32;
+        let idx = (pos.floor() as NSUInteger).min(count - 2);
+        (idx, pos - idx as f32)
+    };
+    let from: id = msg![env; values objectAtIndex:idx];
+    let to: id = msg![env; values objectAtIndex:(idx + 1)];
+    Some((from, to, amount))
+}
 
 pub fn get_animation_start_time(
     env: &mut Environment,

@@ -425,8 +425,16 @@ impl Environment {
             || bundle
                 .bundle_identifier()
                 .starts_with("com.go.starwave.CritterCrunch");
+        // Mass Effect Galaxy reads the C string of a destroyed ExoString in
+        // cg2DAGetString, so freed memory must keep its contents.
+        let is_mass_effect_galaxy = bundle
+            .bundle_identifier()
+            .ends_with("com.ea.masseffectbven");
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free = !is_spore && !is_critter_crunch;
+        mem.zero_memory_on_free = !is_spore && !is_critter_crunch && !is_mass_effect_galaxy;
+        if is_mass_effect_galaxy {
+            log!("Applying game-specific hack for Mass Effect Galaxy: zeroing memory on alloc instead of free.");
+        }
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }

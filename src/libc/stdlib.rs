@@ -655,7 +655,36 @@ fn fcvt(
     fcvt_buf
 }
 
+fn gcvt(env: &mut Environment, value: f64, ndigit: i32, buf: MutPtr<u8>) -> MutPtr<u8> {
+    // Equivalent to sprintf(buf, "%.*g", ndigit, value); use the host's
+    // printf so the %g semantics match exactly.
+    let mut host_buf = [0u8; 512];
+    let n = unsafe {
+        libc::snprintf(
+            host_buf.as_mut_ptr() as *mut libc::c_char,
+            host_buf.len(),
+            c"%.*g".as_ptr(),
+            ndigit.max(1) as libc::c_int,
+            value,
+        )
+    };
+    let len = (n.max(0) as usize).min(host_buf.len() - 1);
+    log_dbg!(
+        "gcvt({}, {}, {:?}) => {:?}",
+        value,
+        ndigit,
+        buf,
+        std::str::from_utf8(&host_buf[..len])
+    );
+    env.mem
+        .bytes_at_mut(buf, len as GuestUSize)
+        .copy_from_slice(&host_buf[..len]);
+    env.mem.write(buf + len as GuestUSize, b'\0');
+    buf
+}
+
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(gcvt(_, _, _)),
     export_c_func!(malloc(_)),
     export_c_func!(malloc_size(_)),
     export_c_func!(calloc(_, _)),
