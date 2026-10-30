@@ -655,31 +655,44 @@ fn fcvt(
     fcvt_buf
 }
 
-fn gcvt(env: &mut Environment, value: f64, ndigit: i32, buf: MutPtr<u8>) -> MutPtr<u8> {
-    // Equivalent to sprintf(buf, "%.*g", ndigit, value); use the host's
-    // printf so the %g semantics match exactly.
-    let mut host_buf = [0u8; 512];
-    let n = unsafe {
-        libc::snprintf(
-            host_buf.as_mut_ptr() as *mut libc::c_char,
-            host_buf.len(),
-            c"%.*g".as_ptr(),
-            ndigit.max(1) as libc::c_int,
-            value,
-        )
+/// Formats `value` like C's `printf("%.*g", precision, value)`.
+pub fn format_g(value: f64, precision: usize) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    let p = precision.max(1);
+    // Exponent after rounding to `p` significant digits.
+    let sci = format!("{:.*e}", p - 1, value);
+    let (mantissa, exp) = sci.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    let strip = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
     };
-    let len = (n.max(0) as usize).min(host_buf.len() - 1);
-    log_dbg!(
-        "gcvt({}, {}, {:?}) => {:?}",
-        value,
-        ndigit,
-        buf,
-        std::str::from_utf8(&host_buf[..len])
-    );
+    if exp < -4 || exp >= p as i32 {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{}{:02}", strip(mantissa), sign, exp.abs())
+    } else {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        strip(&format!("{:.*}", decimals, value))
+    }
+}
+
+fn gcvt(env: &mut Environment, value: f64, ndigit: i32, buf: MutPtr<u8>) -> MutPtr<u8> {
+    // Equivalent to sprintf(buf, "%.*g", ndigit, value).
+    let formatted = format_g(value, ndigit.max(1) as usize);
+    log_dbg!("gcvt({}, {}, {:?}) => {:?}", value, ndigit, buf, formatted);
+    let len = formatted.len() as GuestUSize;
     env.mem
-        .bytes_at_mut(buf, len as GuestUSize)
-        .copy_from_slice(&host_buf[..len]);
-    env.mem.write(buf + len as GuestUSize, b'\0');
+        .bytes_at_mut(buf, len)
+        .copy_from_slice(formatted.as_bytes());
+    env.mem.write(buf + len, b'\0');
     buf
 }
 
