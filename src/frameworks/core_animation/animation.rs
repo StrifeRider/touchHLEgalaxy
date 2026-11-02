@@ -317,40 +317,73 @@ impl State {
     }
 
     pub fn update_started_and_finished_animations(self, env: &mut Environment) {
-        for animation in self.started_animations {
+        // Delegate methods can run arbitrary app code, which may remove (and
+        // thus free) other animations or layers in these lists, so keep them
+        // all alive until we're done.
+        for &animation in &self.started_animations {
+            retain(env, animation);
+        }
+        for &(layer, animation, ..) in &self.finished_animations {
+            retain(env, layer);
+            retain(env, animation);
+        }
+
+        // The delegate methods are optional.
+        let did_start_sel = env
+            .objc
+            .register_host_selector("animationDidStart:".to_string(), &mut env.mem);
+        let did_stop_sel = env
+            .objc
+            .register_host_selector("animationDidStop:finished:".to_string(), &mut env.mem);
+
+        for &animation in &self.started_animations {
             let delegate = msg![env; animation delegate];
-            // The delegate methods are optional.
-            let sel = env
-                .objc
-                .register_host_selector("animationDidStart:".to_string(), &mut env.mem);
-            if delegate != nil && msg![env; delegate respondsToSelector:sel] {
+            if delegate != nil && msg![env; delegate respondsToSelector:did_start_sel] {
                 () = msg![env; delegate animationDidStart: animation];
             }
         }
 
-        for (layer, ..) in &self.finished_animations {
-            retain(env, *layer);
-        }
-        for (layer, animation, finished, removed_on_completion, key) in self.finished_animations {
-            let delegate = msg![env; animation delegate];
-            let sel = env
-                .objc
-                .register_host_selector("animationDidStop:finished:".to_string(), &mut env.mem);
-            if delegate != nil && msg![env; delegate respondsToSelector:sel] {
-                () = msg![env; delegate animationDidStop: animation finished: finished];
+        for (layer, animation, finished, removed_on_completion, key) in &self.finished_animations {
+            let (layer, animation, finished) = (*layer, *animation, *finished);
+            // An earlier delegate call may have removed this animation
+            // already, in which case there's nothing more to do.
+            if !is_animation_attached(env, layer, animation, key.as_deref()) {
+                continue;
             }
-
-            if removed_on_completion {
+            // Like Core Animation, remove the animation before telling the
+            // delegate, so that if the delegate adds a new animation for the
+            // same key, it isn't removed.
+            if *removed_on_completion {
                 if let Some(key) = key {
-                    let key = from_rust_string(env, key);
+                    let key = from_rust_string(env, key.clone());
                     () = msg![env; layer removeAnimationForKey: key];
                 } else {
                     remove_anonymous_animation(env, layer, animation);
                 }
             }
 
+            let delegate = msg![env; animation delegate];
+            if delegate != nil && msg![env; delegate respondsToSelector:did_stop_sel] {
+                () = msg![env; delegate animationDidStop: animation finished: finished];
+            }
+        }
+
+        for animation in self.started_animations {
+            release(env, animation);
+        }
+        for (layer, animation, ..) in self.finished_animations {
+            release(env, animation);
             release(env, layer);
         }
+    }
+}
+
+/// Whether `animation` is (still) attached to `layer`, under `key` if given.
+fn is_animation_attached(env: &Environment, layer: id, animation: id, key: Option<&str>) -> bool {
+    let host_obj = env.objc.borrow::<CALayerHostObject>(layer);
+    match key {
+        Some(key) => host_obj.animations.get(key) == Some(&animation),
+        None => host_obj.anonymous_animations.contains(&animation),
     }
 }
 
